@@ -39,6 +39,9 @@ func (m *Manager) Init(ctx context.Context) error { return m.Storage.Init(ctx) }
 
 // CreateRoot makes a new empty branch and initdbs into it.
 func (m *Manager) CreateRoot(ctx context.Context, name, pgVersion string) (*branch.Branch, error) {
+	if err := branch.ValidateName(name); err != nil {
+		return nil, err
+	}
 	if _, err := m.Repo.Get(name); err == nil {
 		return nil, fmt.Errorf("branch %q already exists", name)
 	}
@@ -68,6 +71,9 @@ func (m *Manager) CreateRoot(ctx context.Context, name, pgVersion string) (*bran
 // is short; the registry record is written before compute starts so a crash
 // mid-fork leaves a row we can clean up rather than orphaned storage.
 func (m *Manager) Fork(ctx context.Context, parentName, name string) (*branch.Branch, error) {
+	if err := branch.ValidateName(name); err != nil {
+		return nil, err
+	}
 	if _, err := m.Repo.Get(name); err == nil {
 		return nil, fmt.Errorf("branch %q already exists", name)
 	}

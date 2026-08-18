@@ -51,8 +51,9 @@ fi
 
 # --- loop devices: required by every pool-in-a-file approach ---
 truncate -s 16M /t.img
-if losetup -f --show /t.img >/dev/null 2>&1; then
+if loop_dev=$(losetup -f --show /t.img 2>/dev/null); then
   r "loop devices" "OK (required by all of the above)"
+  losetup -d "$loop_dev"
 else
   r "loop devices" "FAILED - blocks every pool-in-a-file backend"
 fi

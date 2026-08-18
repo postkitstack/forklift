@@ -45,13 +45,17 @@ type Docker struct {
 	// Postgres (archive_mode off, subscriptions disabled, cron neutered, FDW
 	// user mappings cleared) rather than at the network layer.
 	Network  string
+	BindHost string // defaults to loopback; never publish Postgres on every interface implicitly
 	PortLow  int
 	PortHigh int
 	Password string
 }
 
 func NewDocker() *Docker {
-	return &Docker{Network: "forklift", PortLow: 15500, PortHigh: 15600, Password: "forklift"}
+	return &Docker{
+		Network: "forklift", BindHost: "127.0.0.1",
+		PortLow: 15500, PortHigh: 15600, Password: "forklift",
+	}
 }
 
 // Initdb initialises an empty data directory using the same image the branch
@@ -83,7 +87,7 @@ func (d *Docker) Start(ctx context.Context, dataDir, pgVersion string) (branch.C
 	args := []string{
 		"run", "-d",
 		"--network", d.Network,
-		"-p", fmt.Sprintf("%d:5432", port),
+		"-p", d.publishAddress(port),
 		"-e", "POSTGRES_PASSWORD=" + d.Password,
 		"-e", "PGDATA=/var/lib/postgresql/data",
 		"-v", dataDir + ":/var/lib/postgresql/data",
@@ -159,6 +163,14 @@ func (d *Docker) image(pgVersion string) string {
 		pgVersion = "16"
 	}
 	return "postgres:" + pgVersion
+}
+
+func (d *Docker) publishAddress(port int) string {
+	host := d.BindHost
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)) + ":5432"
 }
 
 func (d *Docker) freePort() (int, error) {

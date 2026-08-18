@@ -112,7 +112,8 @@ func (b *Btrfs) Init(ctx context.Context) error {
 // the directory hits "device or resource busy" — which is how the gap was
 // found. Branch data is unaffected; Init remounts it.
 func (b *Btrfs) Close(ctx context.Context) error {
-	if !b.mounted() {
+	device := b.mountDevice()
+	if device == "" {
 		return nil
 	}
 	// Lazy unmount: detaches immediately and finishes when the last reference
@@ -120,22 +121,46 @@ func (b *Btrfs) Close(ctx context.Context) error {
 	if err := run(ctx, "umount", "-l", b.mountPath()); err != nil {
 		return fmt.Errorf("unmount pool: %w", err)
 	}
-	// mount -o loop attaches a loop device implicitly; release it explicitly.
-	_ = run(ctx, "losetup", "-D")
+	// mount -o loop normally marks its loop device for autoclear. Detach only
+	// this pool's device as a fallback; losetup -D would affect unrelated pools.
+	if strings.HasPrefix(device, "/dev/loop") {
+		_ = run(ctx, "losetup", "-d", device)
+	}
 	return nil
 }
 
-func (b *Btrfs) mounted() bool {
+func (b *Btrfs) mounted() bool { return b.mountDevice() != "" }
+
+func (b *Btrfs) mountDevice() string {
 	out, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		return false
+		return ""
 	}
-	return strings.Contains(string(out), " "+b.mountPath()+" btrfs ")
+	return findMountDevice(string(out), b.mountPath())
+}
+
+func findMountDevice(mounts, target string) string {
+	for _, line := range strings.Split(mounts, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && unescapeMountField(fields[1]) == target && fields[2] == "btrfs" {
+			return unescapeMountField(fields[0])
+		}
+	}
+	return ""
+}
+
+func unescapeMountField(field string) string {
+	return strings.NewReplacer(
+		`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`,
+	).Replace(field)
 }
 
 func (b *Btrfs) subvol(name string) string { return filepath.Join(b.mountPath(), name) }
 
 func (b *Btrfs) CreateRoot(ctx context.Context, name string) (branch.StorageRef, error) {
+	if err := branch.ValidateName(name); err != nil {
+		return branch.StorageRef{}, err
+	}
 	path := b.subvol(name)
 	if err := run(ctx, "btrfs", "subvolume", "create", path); err != nil {
 		return branch.StorageRef{}, fmt.Errorf("create subvolume: %w", err)
@@ -151,6 +176,12 @@ func (b *Btrfs) CreateRoot(ctx context.Context, name string) (branch.StorageRef,
 }
 
 func (b *Btrfs) Fork(ctx context.Context, parent branch.StorageRef, opts ForkOptions) (branch.StorageRef, *branch.ForkPoint, error) {
+	if err := branch.ValidateName(parent.Handle); err != nil {
+		return branch.StorageRef{}, nil, fmt.Errorf("invalid parent storage handle: %w", err)
+	}
+	if err := branch.ValidateName(opts.Name); err != nil {
+		return branch.StorageRef{}, nil, err
+	}
 	src := b.subvol(parent.Handle)
 	dst := b.subvol(opts.Name)
 
@@ -177,6 +208,9 @@ func (b *Btrfs) Fork(ctx context.Context, parent branch.StorageRef, opts ForkOpt
 }
 
 func (b *Btrfs) Delete(ctx context.Context, ref branch.StorageRef) error {
+	if err := branch.ValidateName(ref.Handle); err != nil {
+		return fmt.Errorf("invalid storage handle: %w", err)
+	}
 	kids, err := b.Children(ctx, ref)
 	if err != nil {
 		return err
@@ -192,6 +226,9 @@ func (b *Btrfs) Delete(ctx context.Context, ref branch.StorageRef) error {
 // btrfs tracks this through parent UUIDs rather than names, so we resolve the
 // parent's UUID and match against every subvolume's Parent UUID field.
 func (b *Btrfs) Children(ctx context.Context, ref branch.StorageRef) ([]string, error) {
+	if err := branch.ValidateName(ref.Handle); err != nil {
+		return nil, fmt.Errorf("invalid storage handle: %w", err)
+	}
 	uuid, err := b.subvolUUID(ctx, ref.Handle)
 	if err != nil || uuid == "" {
 		return nil, err

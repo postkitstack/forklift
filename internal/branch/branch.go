@@ -6,7 +6,10 @@
 // detail behind an interface. These types are what all of them agree on.
 package branch
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Status is a branch's lifecycle state.
 //
@@ -66,6 +69,29 @@ type Branch struct {
 	// system, not the agent — an agent merely checks one out.
 	Owner     string     `json:"owner,omitempty"`
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+}
+
+const maxNameLength = 63
+
+// ValidateName rejects branch names that could escape a storage provider's
+// namespace or behave ambiguously in CLI output. Storage providers must still
+// call this at their boundary rather than trusting their callers.
+func ValidateName(name string) error {
+	valid := len(name) > 0 && len(name) <= maxNameLength && isASCIILetterOrDigit(name[0])
+	for i := 1; valid && i < len(name); i++ {
+		c := name[i]
+		valid = isASCIILetterOrDigit(c) || c == '.' || c == '_' || c == '-'
+	}
+	if !valid {
+		return fmt.Errorf(
+			"invalid branch name %q: use 1-%d ASCII letters, digits, '.', '_' or '-', starting with a letter or digit",
+			name, maxNameLength)
+	}
+	return nil
+}
+
+func isASCIILetterOrDigit(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
 // IsRoot reports whether this branch has no parent.
