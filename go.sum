@@ -1,4 +1,8 @@
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
+github.com/dennwc/btrfs v0.0.0-20260222081608-edfb8b9e4f55 h1:VAnGuI8RNnP8vHqCn8X1O63TexAv+QjMqffBdkLbYKU=
+github.com/dennwc/btrfs v0.0.0-20260222081608-edfb8b9e4f55/go.mod h1:Kn6RQo4OP1ZEoLB3uldDJabFcf72VgDRInxEqLEo8OE=
+github.com/dennwc/ioctl v1.0.1-0.20181021180353-017804252068 h1:K71w/n/Y74EQsKo91511t7TK35YRPrk9G+2anKYNPXk=
+github.com/dennwc/ioctl v1.0.1-0.20181021180353-017804252068/go.mod h1:ellh2YB5ldny99SBU/VX7Nq0xiZbHphf1DrtHxxjMk0=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
 github.com/inconshreveable/mousetrap v1.1.0/go.mod h1:vpF70FUmC8bwa3OWnCshd2FqLfsEA9PFc4w1p2J65bw=
 github.com/lib/pq v1.12.3 h1:tTWxr2YLKwIvK90ZXEw8GP7UFHtcbTtty8zsI+YjrfQ=
