@@ -1,10 +1,8 @@
 BINARY  := bin/forklift
 PKG     := ./cmd/forklift
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-# sudo resets PATH to secure_path, which excludes /usr/local/go/bin, so plain
-# "sudo make test-integration" would die in the build prerequisite with
-# "go: not found". Fall back to the absolute path when go is not on PATH.
-GO      ?= $(shell command -v go 2>/dev/null || echo /usr/local/go/bin/go)
+GO      ?= go
+PREFIX  ?= /usr/local
 
 .PHONY: help build install test test-integration vet fmt clean doctor
 
@@ -17,15 +15,31 @@ build: ## Build the binary into bin/
 	$(GO) build -ldflags "-X main.version=$(VERSION)" -o $(BINARY) $(PKG)
 	@echo "built $(BINARY) ($(VERSION))"
 
-install: ## Install to GOBIN
-	$(GO) install -ldflags "-X main.version=$(VERSION)" $(PKG)
+install: build ## Install to $(PREFIX)/bin (on sudo's secure_path)
+	@if [ "$$(id -u)" = 0 ]; then \
+		install -m 0755 $(BINARY) $(PREFIX)/bin/forklift; \
+	else \
+		sudo install -m 0755 $(BINARY) $(PREFIX)/bin/forklift; \
+	fi
+	@echo "installed $(PREFIX)/bin/forklift"
 
 test: ## Unit tests (no root needed)
 	$(GO) test ./...
 
-test-integration: build ## Storage conformance suite (needs root + btrfs-progs)
-	@echo "Running as root — the pool needs loop devices and mount."
-	sudo -E env "PATH=$$PATH" $(GO) test ./internal/storage/ -run Conformance -v
+# Run WITHOUT sudo: this recipe elevates itself, forwarding PATH, because sudo
+# resets PATH to secure_path and would lose the Go toolchain.
+test-integration: ## Storage conformance suite (needs btrfs-progs; elevates itself)
+	@command -v $(GO) >/dev/null 2>&1 || { \
+		echo "go not found on PATH."; \
+		echo "If you typed 'sudo make', run 'make test-integration' instead —"; \
+		echo "the recipe elevates itself and sudo strips Go from PATH."; \
+		exit 1; }
+	@if [ "$$(id -u)" = 0 ]; then \
+		$(GO) test ./internal/storage/ -run Conformance -v; \
+	else \
+		echo "Elevating for the pool (loop devices, mount)..."; \
+		sudo -E env "PATH=$$PATH" $(GO) test ./internal/storage/ -run Conformance -v; \
+	fi
 
 vet: ## go vet
 	$(GO) vet ./...
