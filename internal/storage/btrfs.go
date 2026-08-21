@@ -6,12 +6,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dennwc/btrfs"
 	"github.com/postkitstack/forklift/internal/branch"
+	"github.com/postkitstack/forklift/internal/tool"
 )
+
+// Subvolume operations go through the pure-Go github.com/dennwc/btrfs library
+// (kernel ioctls underneath) rather than shelling out to the btrfs CLI: the
+// CLI's human-readable output is not a stable interface, and parsing it broke
+// across btrfs-progs versions. Only mkfs.btrfs, mount/umount/losetup and
+// modprobe still run as external commands — the kernel exposes no ioctl for
+// formatting or mounting.
 
 // Btrfs stores each branch as a btrfs subvolume inside a pool that lives in a
 // single loopback-mounted file.
@@ -59,20 +67,12 @@ func (b *Btrfs) Available(ctx context.Context) (bool, string) {
 	if os.Geteuid() != 0 {
 		return false, "requires root (loop devices, mount, btrfs subvolume)"
 	}
-	fs, err := os.ReadFile("/proc/filesystems")
-	if err != nil {
-		return false, "cannot read /proc/filesystems: " + err.Error()
+	supported, why := btrfsKernelSupport(ctx)
+	if !supported {
+		return false, why
 	}
-	if !strings.Contains(string(fs), "btrfs") {
-		// Try loading it before giving up.
-		_ = exec.CommandContext(ctx, "modprobe", "btrfs").Run()
-		fs, _ = os.ReadFile("/proc/filesystems")
-		if !strings.Contains(string(fs), "btrfs") {
-			return false, "btrfs not supported by this kernel"
-		}
-	}
-	if _, err := exec.LookPath("btrfs"); err != nil {
-		return false, "btrfs-progs not installed"
+	if _, err := tool.Resolve("mkfs.btrfs"); err != nil {
+		return false, "btrfs-progs not installed (mkfs.btrfs is required to format the pool)"
 	}
 	return true, ""
 }
@@ -88,8 +88,14 @@ func (b *Btrfs) Init(ctx context.Context) error {
 		return nil // already initialised
 	}
 	if _, err := os.Stat(b.imagePath()); os.IsNotExist(err) {
-		size := strconv.Itoa(b.PoolSizeGB) + "G"
-		if err := run(ctx, "truncate", "-s", size, b.imagePath()); err != nil {
+		f, err := os.Create(b.imagePath())
+		if err != nil {
+			return fmt.Errorf("create pool image: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("create pool image: %w", err)
+		}
+		if err := os.Truncate(b.imagePath(), int64(b.PoolSizeGB)<<30); err != nil {
 			return fmt.Errorf("create pool image: %w", err)
 		}
 		if err := run(ctx, "mkfs.btrfs", "-q", "-f", b.imagePath()); err != nil {
@@ -162,7 +168,7 @@ func (b *Btrfs) CreateRoot(ctx context.Context, name string) (branch.StorageRef,
 		return branch.StorageRef{}, err
 	}
 	path := b.subvol(name)
-	if err := run(ctx, "btrfs", "subvolume", "create", path); err != nil {
+	if err := btrfs.CreateSubVolume(path); err != nil {
 		return branch.StorageRef{}, fmt.Errorf("create subvolume: %w", err)
 	}
 	data := filepath.Join(path, "pgdata")
@@ -191,14 +197,14 @@ func (b *Btrfs) Fork(ctx context.Context, parent branch.StorageRef, opts ForkOpt
 
 	// The snapshot itself. Atomic, and the parent keeps serving throughout.
 	started := time.Now()
-	if err := run(ctx, "btrfs", "subvolume", "snapshot", src, dst); err != nil {
+	if err := btrfs.SnapshotSubVolume(src, dst, false); err != nil {
 		return branch.StorageRef{}, nil, fmt.Errorf("snapshot: %w", err)
 	}
 
 	data := filepath.Join(dst, "pgdata")
 	if err := PrepareClone(data, b.PGUID, b.PGGID); err != nil {
 		// Roll back so a failed fork does not leave storage behind.
-		_ = run(ctx, "btrfs", "subvolume", "delete", dst)
+		_ = btrfs.DeleteSubVolume(dst)
 		return branch.StorageRef{}, nil, err
 	}
 
@@ -218,100 +224,82 @@ func (b *Btrfs) Delete(ctx context.Context, ref branch.StorageRef) error {
 	if len(kids) > 0 {
 		return &ErrHasChildren{Handle: ref.Handle, Children: kids}
 	}
-	return run(ctx, "btrfs", "subvolume", "delete", b.subvol(ref.Handle))
+	if err := btrfs.DeleteSubVolume(b.subvol(ref.Handle)); err != nil {
+		return fmt.Errorf("delete subvolume: %w", err)
+	}
+	return nil
 }
 
 // Children reports subvolumes forked from ref.
 //
 // btrfs tracks this through parent UUIDs rather than names, so we resolve the
-// parent's UUID and match against every subvolume's Parent UUID field.
+// parent's UUID and match it against every subvolume's ParentUUID in a single
+// ioctl-driven walk of the pool mount (no CLI text parsing).
 func (b *Btrfs) Children(ctx context.Context, ref branch.StorageRef) ([]string, error) {
 	if err := branch.ValidateName(ref.Handle); err != nil {
 		return nil, fmt.Errorf("invalid storage handle: %w", err)
 	}
-	uuid, err := b.subvolUUID(ctx, ref.Handle)
-	if err != nil || uuid == "" {
-		return nil, err
+	fs, err := btrfs.Open(b.mountPath(), true)
+	if err != nil {
+		return nil, fmt.Errorf("open pool mount: %w", err)
 	}
-	out, err := output(ctx, "btrfs", "subvolume", "list", "-u", "-q", b.mountPath())
+	defer fs.Close()
+	uuid, err := b.subvolUUID(fs, ref.Handle)
 	if err != nil {
 		return nil, err
 	}
+	if uuid == (btrfs.UUID{}) {
+		return nil, nil
+	}
+	subs, err := fs.ListSubvolumes(nil)
+	if err != nil {
+		return nil, fmt.Errorf("list subvolumes: %w", err)
+	}
 	var kids []string
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.Contains(line, "parent_uuid "+uuid) {
-			continue
-		}
-		if i := strings.LastIndex(line, " path "); i >= 0 {
-			name := strings.TrimSpace(line[i+len(" path "):])
-			if name != ref.Handle {
-				kids = append(kids, name)
-			}
+	for _, sub := range subs {
+		if sub.ParentUUID == uuid && sub.Path != ref.Handle {
+			kids = append(kids, sub.Path)
 		}
 	}
 	return kids, nil
 }
 
-func (b *Btrfs) subvolUUID(ctx context.Context, name string) (string, error) {
-	out, err := output(ctx, "btrfs", "subvolume", "show", b.subvol(name))
+func (b *Btrfs) subvolUUID(fs *btrfs.FS, name string) (btrfs.UUID, error) {
+	info, err := fs.SubvolumeByPath(name)
 	if err != nil {
-		return "", err
+		return btrfs.UUID{}, fmt.Errorf("resolve subvolume %q: %w", name, err)
 	}
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "UUID:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "UUID:")), nil
-		}
-	}
-	return "", nil
+	return info.UUID, nil
 }
 
 func (b *Btrfs) Usage(ctx context.Context) (Usage, error) {
 	var u Usage
-	out, err := output(ctx, "btrfs", "filesystem", "usage", "-b", b.mountPath())
+	fs, err := btrfs.Open(b.mountPath(), true)
 	if err != nil {
-		return u, err
+		return u, fmt.Errorf("open pool mount: %w", err)
 	}
-	// "Used:" carries only two fields, so guard at 2 rather than 3 — at 3 it is
-	// silently skipped and the pool always reports empty, which would make the
-	// watermark check useless exactly when it matters.
-	for _, line := range strings.Split(out, "\n") {
-		trimmed := strings.TrimSpace(line)
-		f := strings.Fields(trimmed)
-		if len(f) < 2 {
-			continue
-		}
-		switch {
-		case strings.HasPrefix(trimmed, "Device size:"):
-			u.TotalBytes = parseUint(f[len(f)-1])
-		case strings.HasPrefix(trimmed, "Used:"):
-			if u.UsedBytes == 0 {
-				u.UsedBytes = parseUint(f[len(f)-1])
-			}
-		}
+	defer fs.Close()
+	usage, err := fs.Usage()
+	if err != nil {
+		return u, fmt.Errorf("query pool usage: %w", err)
 	}
+	u.UsedBytes = usage.TotalUsed
+	u.TotalBytes = usage.Total
 	return u, nil
 }
 
-func parseUint(s string) uint64 {
-	v, _ := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
-	return v
-}
-
+// run shells out to an external command. The binary is resolved by absolute
+// path (see package tool): mount helpers live in /usr/sbin, which is off a
+// normal non-root PATH and off sudo's secure_path alike.
 func run(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
+	exe, err := tool.Resolve(name)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
-}
-
-func output(ctx context.Context, name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
-	}
-	return string(out), nil
 }

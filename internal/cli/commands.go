@@ -7,6 +7,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/postkitstack/forklift/internal/compute"
 	"github.com/postkitstack/forklift/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -27,15 +28,17 @@ multipath/striped/linear/error device-mapper targets, no nbd, and no reflink.`,
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "MECHANISM\tSTATUS\tDETAIL")
 			for _, m := range ms {
-				status := "unavailable"
-				if m.Available {
-					status = "available"
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\n", m.Name, status, m.Detail)
+				fmt.Fprintf(w, "%s\t%s\t%s\n", m.Name, stateWord(m.State), m.Detail)
 			}
 			fmt.Fprintf(w, "loop devices\t%s\t%s\n",
-				boolWord(storage.LoopDevicesWork(ctx), "working", "unavailable"),
+				stateWord(storage.LoopDevicesState(ctx)),
 				"required by every pool-in-a-file mechanism")
+			if di, err := compute.InspectDaemon(ctx); err == nil {
+				fmt.Fprintf(w, "docker\tavailable\tcontext %s, rootless %s, id %s\n",
+					di.Context, boolWord(di.Rootless, "yes", "no"), di.ID)
+			} else {
+				fmt.Fprintf(w, "docker\tunavailable\t%s\n", err)
+			}
 			w.Flush()
 
 			fmt.Println()
@@ -45,10 +48,24 @@ multipath/striped/linear/error device-mapper targets, no nbd, and no reflink.`,
 				fmt.Println("No COW mechanism available on this machine.")
 			}
 			if os.Geteuid() != 0 {
-				fmt.Println("\nNote: not running as root, so some probes could not be attempted.")
+				fmt.Println("\nNote: probes marked \"unknown\" could not run without root; re-run with sudo to determine them.")
 			}
 			return nil
 		},
+	}
+}
+
+// stateWord renders a probe result. Unknown must stay visibly distinct from
+// unavailable: telling a user a mechanism is absent when we merely lacked
+// permission to check makes doctor lie.
+func stateWord(s storage.State) string {
+	switch s {
+	case storage.StateAvailable:
+		return "available"
+	case storage.StateUnavailable:
+		return "unavailable"
+	default:
+		return "unknown — re-run with sudo to determine"
 	}
 }
 
@@ -60,7 +77,7 @@ func newInitCmd() *cobra.Command {
 			if err := requireRoot(); err != nil {
 				return err
 			}
-			m, err := buildManager()
+			m, err := buildManager(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -83,7 +100,7 @@ func newCreateCmd() *cobra.Command {
 			if err := requireRoot(); err != nil {
 				return err
 			}
-			m, err := buildManager()
+			m, err := buildManager(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -124,7 +141,7 @@ func newListCmd() *cobra.Command {
 		Aliases: []string{"ls"},
 		Short:   "List branches",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			m, err := buildManager()
+			m, err := buildManager(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -167,7 +184,7 @@ func newInspectCmd() *cobra.Command {
 		Short: "Show one branch in detail",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m, err := buildManager()
+			m, err := buildManager(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -212,7 +229,7 @@ func newStartCmd() *cobra.Command {
 			if err := requireRoot(); err != nil {
 				return err
 			}
-			m, err := buildManager()
+			m, err := buildManager(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -235,7 +252,7 @@ func newStopCmd() *cobra.Command {
 		Short: "Stop a branch's Postgres, keeping its data",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m, err := buildManager()
+			m, err := buildManager(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -259,7 +276,7 @@ func newDeleteCmd() *cobra.Command {
 			if err := requireRoot(); err != nil {
 				return err
 			}
-			m, err := buildManager()
+			m, err := buildManager(cmd.Context())
 			if err != nil {
 				return err
 			}
