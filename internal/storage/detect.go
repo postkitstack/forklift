@@ -10,12 +10,26 @@ import (
 	"github.com/postkitstack/forklift/internal/tool"
 )
 
-// Mechanism is one candidate COW implementation, with whether this machine can
-// actually provide it.
+// State is what a probe actually established. Conflating these states made
+// doctor lie: a probe that could not run for lack of privilege was reported
+// identically to one that ran and came back negative, so users were told a
+// mechanism was "unavailable" when the truth was "we could not look".
+type State int
+
+const (
+	// StateUnknown means the probe could not run from here — usually it
+	// needs root. It is not a negative answer.
+	StateUnknown State = iota
+	StateUnavailable
+	StateAvailable
+)
+
+// Mechanism is one candidate COW implementation, with what this machine's
+// probe established about it.
 type Mechanism struct {
-	Name      string
-	Available bool
-	Detail    string
+	Name   string
+	State  State
+	Detail string
 	// Preference orders the candidates; lower is better.
 	Preference int
 }
@@ -37,12 +51,14 @@ func Detect(ctx context.Context) []Mechanism {
 	}
 }
 
-// Best returns the highest-preference available mechanism, or "" if none.
+// Best returns the highest-preference mechanism that is definitely available,
+// or "" if none is. Unknown mechanisms are never selected: an unprobed
+// candidate must not win by accident.
 func Best(ms []Mechanism) string {
 	best := ""
 	bestPref := 1 << 30
 	for _, m := range ms {
-		if m.Available && m.Preference < bestPref {
+		if m.State == StateAvailable && m.Preference < bestPref {
 			best, bestPref = m.Name, m.Preference
 		}
 	}
@@ -57,17 +73,23 @@ func detectDmThin(ctx context.Context) Mechanism {
 	}
 	dmsetup, err := tool.Resolve("dmsetup")
 	if err != nil {
-		m.Detail = "dmsetup unavailable, cannot determine"
+		// Without the userspace tool we cannot look at all; that is not a
+		// negative answer about the kernel target.
+		m.State = StateUnknown
+		m.Detail = "dmsetup not installed; cannot determine"
 		return m
 	}
 	out, err := exec.CommandContext(ctx, dmsetup, "targets").Output()
 	if err != nil {
-		m.Detail = "dmsetup unavailable, cannot determine"
+		// As a normal user this fails with "/dev/mapper/control: open
+		// failed: Permission denied" even when dm-thin works fine as root.
+		m.State = StateUnknown
+		m.Detail = "requires root to query dm targets"
 		return m
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		if strings.HasPrefix(line, "thin-pool") {
-			m.Available = true
+			m.State = StateAvailable
 			return m
 		}
 	}
@@ -77,6 +99,7 @@ func detectDmThin(ctx context.Context) Mechanism {
 			names = append(names, f[0])
 		}
 	}
+	m.State = StateUnavailable
 	m.Detail = "absent; dm targets present: " + strings.Join(names, ", ")
 	return m
 }
@@ -127,14 +150,16 @@ func detectBtrfs(ctx context.Context) Mechanism {
 		Detail: "validated: 210ms live snapshot, clean recovery, depth-2 verified"}
 	supported, why := btrfsKernelSupport(ctx)
 	if !supported {
+		m.State = StateUnavailable
 		m.Detail = why
 		return m
 	}
 	if _, err := tool.Resolve("mkfs.btrfs"); err != nil {
+		m.State = StateUnavailable
 		m.Detail = "kernel supports btrfs but mkfs.btrfs is not installed"
 		return m
 	}
-	m.Available = true
+	m.State = StateAvailable
 	return m
 }
 
@@ -145,8 +170,9 @@ func detectNBD(ctx context.Context) Mechanism {
 		_ = exec.CommandContext(ctx, exe, "nbd").Run()
 	}
 	if _, err := os.Stat("/dev/nbd0"); err == nil {
-		m.Available = true
+		m.State = StateAvailable
 	} else {
+		m.State = StateUnavailable
 		m.Detail = "absent (/dev/nbd0 missing)"
 	}
 	return m
@@ -157,6 +183,7 @@ func detectReflink(ctx context.Context) Mechanism {
 		Detail: "unprivileged floor; degrades to a full copy where unsupported"}
 	dir, err := os.MkdirTemp("", "forklift-reflink")
 	if err != nil {
+		m.State = StateUnknown
 		m.Detail = "could not test: " + err.Error()
 		return m
 	}
@@ -164,50 +191,58 @@ func detectReflink(ctx context.Context) Mechanism {
 
 	src := dir + "/a"
 	if err := os.WriteFile(src, []byte("x"), 0o600); err != nil {
+		m.State = StateUnknown
 		m.Detail = "could not test: " + err.Error()
 		return m
 	}
 	cp, err := tool.Resolve("cp")
 	if err != nil {
+		m.State = StateUnknown
 		m.Detail = "could not test: " + err.Error()
 		return m
 	}
 	if err := exec.CommandContext(ctx, cp, "--reflink=always", src, dir+"/b").Run(); err == nil {
-		m.Available = true
+		m.State = StateAvailable
 		return m
 	}
+	// The probe ran to completion; a negative here is a real answer.
+	m.State = StateUnavailable
 	m.Detail = "filesystem does not support reflink"
 	return m
 }
 
-// LoopDevicesWork reports whether we can attach a loop device, which every
-// pool-in-a-file mechanism depends on.
-func LoopDevicesWork(ctx context.Context) bool {
+// LoopDevicesState reports whether we can attach a loop device, which every
+// pool-in-a-file mechanism depends on. Attaching requires root, so from an
+// unprivileged process the honest answer is unknown, not no.
+func LoopDevicesState(ctx context.Context) State {
 	if os.Geteuid() != 0 {
-		return false
+		return StateUnknown
 	}
 	f, err := os.CreateTemp("", "forklift-loop")
 	if err != nil {
-		return false
+		return StateUnavailable
 	}
 	defer os.Remove(f.Name())
 	f.Close()
 	truncate, err := tool.Resolve("truncate")
 	if err != nil {
-		return false
+		return StateUnavailable
 	}
 	losetup, err := tool.Resolve("losetup")
 	if err != nil {
-		return false
+		return StateUnavailable
 	}
 	if err := exec.CommandContext(ctx, truncate, "-s", "16M", f.Name()).Run(); err != nil {
-		return false
+		return StateUnavailable
 	}
 	out, err := exec.CommandContext(ctx, losetup, "-f", "--show", f.Name()).Output()
 	if err != nil {
-		return false
+		return StateUnavailable
 	}
 	dev := strings.TrimSpace(string(out))
 	_ = exec.CommandContext(ctx, losetup, "-d", dev).Run()
-	return dev != ""
+	if dev == "" {
+		return StateUnavailable
+	}
+	return StateAvailable
 }

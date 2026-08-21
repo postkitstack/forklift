@@ -27,14 +27,10 @@ multipath/striped/linear/error device-mapper targets, no nbd, and no reflink.`,
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "MECHANISM\tSTATUS\tDETAIL")
 			for _, m := range ms {
-				status := "unavailable"
-				if m.Available {
-					status = "available"
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\n", m.Name, status, m.Detail)
+				fmt.Fprintf(w, "%s\t%s\t%s\n", m.Name, stateWord(m.State), m.Detail)
 			}
 			fmt.Fprintf(w, "loop devices\t%s\t%s\n",
-				boolWord(storage.LoopDevicesWork(ctx), "working", "unavailable"),
+				stateWord(storage.LoopDevicesState(ctx)),
 				"required by every pool-in-a-file mechanism")
 			w.Flush()
 
@@ -45,10 +41,24 @@ multipath/striped/linear/error device-mapper targets, no nbd, and no reflink.`,
 				fmt.Println("No COW mechanism available on this machine.")
 			}
 			if os.Geteuid() != 0 {
-				fmt.Println("\nNote: not running as root, so some probes could not be attempted.")
+				fmt.Println("\nNote: probes marked \"unknown\" could not run without root; re-run with sudo to determine them.")
 			}
 			return nil
 		},
+	}
+}
+
+// stateWord renders a probe result. Unknown must stay visibly distinct from
+// unavailable: telling a user a mechanism is absent when we merely lacked
+// permission to check makes doctor lie.
+func stateWord(s storage.State) string {
+	switch s {
+	case storage.StateAvailable:
+		return "available"
+	case storage.StateUnavailable:
+		return "unavailable"
+	default:
+		return "unknown — re-run with sudo to determine"
 	}
 }
 
@@ -277,13 +287,6 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
-}
-
-func boolWord(b bool, yes, no string) string {
-	if b {
-		return yes
-	}
-	return no
 }
 
 func humanBytes(n uint64) string {
