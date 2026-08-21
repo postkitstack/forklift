@@ -87,16 +87,31 @@ universally available. Probing a plain Linux Docker host found dm-thin absent �
 only `multipath, striped, linear, error` device-mapper targets, with an empty
 `/lib/modules` — plus no nbd and no reflink, since the filesystem was overlayfs.
 
+`doctor` needs no root, but some probes do — it says so rather than guessing:
+
 ```
 $ forklift doctor
-MECHANISM     STATUS       DETAIL
-dm-thin       unavailable  absent; dm targets present: multipath, striped, linear, error
-btrfs         available    validated: 210ms live snapshot, clean recovery, depth-2 verified
-nbd (qcow2)   unavailable  absent (/dev/nbd0 missing)
-reflink       unavailable  filesystem does not support reflink
-loop devices  working      required by every pool-in-a-file mechanism
+MECHANISM     STATUS                                   DETAIL
+dm-thin       unknown — re-run with sudo to determine  requires root to query dm targets
+btrfs         available                                validated: 210ms live snapshot, clean recovery, depth-2 verified
+nbd (qcow2)   unavailable                              absent (/dev/nbd0 missing)
+reflink       unavailable                              filesystem does not support reflink
+loop devices  unknown — re-run with sudo to determine  required by every pool-in-a-file mechanism
+docker        available                                context default, rootless no, id a64d6a4e-...
 
 Best available mechanism: btrfs
+
+Note: probes marked "unknown" could not run without root; re-run with sudo to determine them.
+```
+
+`unknown` is deliberately distinct from `unavailable`. Querying dm targets needs
+`/dev/mapper/control`, and probing loop devices needs to attach one — neither is
+possible unprivileged. Reporting those as "unavailable" would tell you a
+mechanism does not work on your machine when it does. Under `sudo` they resolve:
+
+```
+dm-thin       unavailable  absent; dm targets present: multipath, striped, linear, error
+loop devices  available    required by every pool-in-a-file mechanism
 ```
 
 | Mechanism | Status | Notes |
@@ -120,10 +135,18 @@ work on macOS, where a ZFS-on-the-host approach cannot — untested, see below.
 Requires Linux, root (loop devices, `mount`, btrfs subvolumes), `btrfs-progs`,
 and Docker.
 
-```bash
-make build
+`make install` deliberately targets `/usr/local/bin` rather than `GOBIN`.
+`go install` puts the binary in `~/go/bin`, which is **not** on sudo's
+`secure_path`, so `sudo forklift ...` would fail with `command not found` — and
+every pool command needs root. Override with `make install PREFIX=/somewhere`.
+If you do run it from an unusual location, forklift prints the exact
+`sudo /abs/path/forklift ...` line to re-run.
 
-sudo ./bin/forklift doctor              # what can this machine do?
+```bash
+make build                              # -> ./bin/forklift
+make install                            # -> /usr/local/bin/forklift
+
+sudo forklift doctor                    # what can this machine do?
 sudo ./bin/forklift init                # create the pool
 sudo ./bin/forklift create main         # empty branch, runs initdb
 sudo ./bin/forklift create agent-a --from main
@@ -164,8 +187,14 @@ child would believe it was the authoritative source of truth about all branches.
 
 ```bash
 make test               # unit tests, no root required
-make test-integration   # conformance suite against btrfs; needs root
+make test-integration   # conformance suite against btrfs — run WITHOUT sudo
 ```
+
+`make test-integration` elevates itself. Do not prefix it with `sudo`: sudo
+replaces `PATH` with its `secure_path`, which excludes the Go toolchain, so
+`sudo make` fails with `go: not found` before any test runs. The target detects
+that and tells you to drop the sudo. If you are already root (a CI container,
+say) it runs `go test` directly instead of nesting sudo.
 
 ## Known gaps
 
