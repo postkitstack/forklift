@@ -78,10 +78,28 @@ func (b *Btrfs) Available(ctx context.Context) (bool, string) {
 			return false, "btrfs not supported by this kernel"
 		}
 	}
-	if _, err := exec.LookPath("mkfs.btrfs"); err != nil {
+	if !mkfsBtrfsPresent() {
 		return false, "btrfs-progs not installed (mkfs.btrfs is required to format the pool)"
 	}
 	return true, ""
+}
+
+// mkfsBtrfsPresent reports whether mkfs.btrfs is installed.
+//
+// It lives in /usr/sbin or /sbin, which Debian/Ubuntu keep off a normal
+// non-root PATH while /usr/bin/btrfs is always reachable, so a bare LookPath
+// false-negatives for unprivileged callers like doctor. Stat the usual
+// locations before giving up.
+func mkfsBtrfsPresent() bool {
+	if _, err := exec.LookPath("mkfs.btrfs"); err == nil {
+		return true
+	}
+	for _, p := range []string{"/usr/sbin/mkfs.btrfs", "/sbin/mkfs.btrfs"} {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Btrfs) Init(ctx context.Context) error {

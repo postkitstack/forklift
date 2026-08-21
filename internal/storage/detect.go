@@ -77,8 +77,8 @@ func detectBtrfs(ctx context.Context) Mechanism {
 	_ = exec.CommandContext(ctx, "modprobe", "btrfs").Run()
 	fs, err := os.ReadFile("/proc/filesystems")
 	if err == nil && strings.Contains(string(fs), "btrfs") {
-		if _, err := exec.LookPath("btrfs"); err != nil {
-			m.Detail = "kernel supports btrfs but btrfs-progs is not installed"
+		if !mkfsBtrfsPresent() {
+			m.Detail = "kernel supports btrfs but mkfs.btrfs is not installed"
 			return m
 		}
 		m.Available = true
