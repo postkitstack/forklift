@@ -67,19 +67,9 @@ func (b *Btrfs) Available(ctx context.Context) (bool, string) {
 	if os.Geteuid() != 0 {
 		return false, "requires root (loop devices, mount, btrfs subvolume)"
 	}
-	fs, err := os.ReadFile("/proc/filesystems")
-	if err != nil {
-		return false, "cannot read /proc/filesystems: " + err.Error()
-	}
-	if !strings.Contains(string(fs), "btrfs") {
-		// Try loading it before giving up.
-		if exe, err := tool.Resolve("modprobe"); err == nil {
-			_ = exec.CommandContext(ctx, exe, "btrfs").Run()
-		}
-		fs, _ = os.ReadFile("/proc/filesystems")
-		if !strings.Contains(string(fs), "btrfs") {
-			return false, "btrfs not supported by this kernel"
-		}
+	supported, why := btrfsKernelSupport(ctx)
+	if !supported {
+		return false, why
 	}
 	if _, err := tool.Resolve("mkfs.btrfs"); err != nil {
 		return false, "btrfs-progs not installed (mkfs.btrfs is required to format the pool)"

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -80,22 +81,60 @@ func detectDmThin(ctx context.Context) Mechanism {
 	return m
 }
 
+// btrfsKernelSupport reports whether the kernel currently has btrfs, trying
+// to load the module first, and explains which case actually holds.
+//
+// The old code discarded modprobe's error and declared "not supported by this
+// kernel" on any failure — a guess. On hosts without kmod or /lib/modules
+// (common in minimal containers) that assertion was unfounded: the module
+// might exist but simply never have been loaded.
+func btrfsKernelSupport(ctx context.Context) (bool, string) {
+	fs, err := os.ReadFile("/proc/filesystems")
+	if err != nil {
+		return false, "cannot read /proc/filesystems: " + err.Error()
+	}
+	if strings.Contains(string(fs), "btrfs") {
+		return true, ""
+	}
+	modprobe, err := tool.Resolve("modprobe")
+	if err != nil {
+		return false, "btrfs not loaded and modprobe is unavailable to load it"
+	}
+	if _, err := os.Stat("/lib/modules/" + kernelRelease()); err != nil {
+		return false, "this kernel has no loadable modules"
+	}
+	out, err := exec.CommandContext(ctx, modprobe, "btrfs").CombinedOutput()
+	if err != nil {
+		return false, fmt.Sprintf("btrfs not loaded; modprobe failed: %s", strings.TrimSpace(string(out)))
+	}
+	fs, _ = os.ReadFile("/proc/filesystems")
+	if !strings.Contains(string(fs), "btrfs") {
+		return false, "btrfs not loaded; modprobe succeeded but btrfs is still absent from /proc/filesystems"
+	}
+	return true, ""
+}
+
+func kernelRelease() string {
+	b, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
 func detectBtrfs(ctx context.Context) Mechanism {
 	m := Mechanism{Name: "btrfs", Preference: 2,
 		Detail: "validated: 210ms live snapshot, clean recovery, depth-2 verified"}
-	if exe, err := tool.Resolve("modprobe"); err == nil {
-		_ = exec.CommandContext(ctx, exe, "btrfs").Run()
-	}
-	fs, err := os.ReadFile("/proc/filesystems")
-	if err == nil && strings.Contains(string(fs), "btrfs") {
-		if _, err := tool.Resolve("mkfs.btrfs"); err != nil {
-			m.Detail = "kernel supports btrfs but mkfs.btrfs is not installed"
-			return m
-		}
-		m.Available = true
+	supported, why := btrfsKernelSupport(ctx)
+	if !supported {
+		m.Detail = why
 		return m
 	}
-	m.Detail = "not supported by this kernel"
+	if _, err := tool.Resolve("mkfs.btrfs"); err != nil {
+		m.Detail = "kernel supports btrfs but mkfs.btrfs is not installed"
+		return m
+	}
+	m.Available = true
 	return m
 }
 
