@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/postkitstack/forklift/internal/compute"
 	"github.com/postkitstack/forklift/internal/manager"
@@ -70,9 +71,19 @@ func buildManager() (*manager.Manager, error) {
 
 func requireRoot() error {
 	if os.Geteuid() != 0 {
+		// Resolve the binary by absolute path: `sudo forklift` fails outright
+		// when the binary is not on sudo's secure_path (go install lands it in
+		// ~/go/bin), so a bare "Re-run with sudo" would suggest a command that
+		// cannot work.
+		exe, err := os.Executable()
+		if err != nil || exe == "" {
+			exe = "forklift"
+		}
 		return fmt.Errorf(
-			"this command needs root: the storage pool uses loop devices, mount and btrfs subvolumes.\n" +
-				"Re-run with sudo, or point --root at a pool you already own")
+			"this command needs root: the storage pool uses loop devices, mount and btrfs subvolumes.\n"+
+				"Re-run:  sudo %s %s\n"+
+				"or point --root at a pool you already own",
+			exe, strings.Join(os.Args[1:], " "))
 	}
 	return nil
 }
