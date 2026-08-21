@@ -1,7 +1,10 @@
 BINARY  := bin/forklift
 PKG     := ./cmd/forklift
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-GO      ?= go
+# sudo resets PATH to secure_path, which excludes /usr/local/go/bin, so plain
+# "sudo make test-integration" would die in the build prerequisite with
+# "go: not found". Fall back to the absolute path when go is not on PATH.
+GO      ?= $(shell command -v go 2>/dev/null || echo /usr/local/go/bin/go)
 
 .PHONY: help build install test test-integration vet fmt clean doctor
 
