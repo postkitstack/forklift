@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -62,8 +63,13 @@ func defaultRoot() string {
 }
 
 // buildManager assembles the object graph. Storage is chosen here, which is
-// the one place the mechanism decision is made.
-func buildManager() (*manager.Manager, error) {
+// the one place the mechanism decision is made. Every command that touches
+// branches goes through this, so it is also the choke point for refusing a
+// sudo-forked Docker daemon.
+func buildManager(ctx context.Context) (*manager.Manager, error) {
+	if err := compute.EnsureSameDaemonAsUser(ctx); err != nil {
+		return nil, err
+	}
 	store := storage.NewBtrfs(flagRoot, flagPoolGB)
 	repo := metadata.NewJSONRepo(filepath.Join(flagRoot, "branches.json"))
 	return manager.New(store, compute.NewDocker(), repo), nil
