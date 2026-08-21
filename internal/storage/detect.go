@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/postkitstack/forklift/internal/tool"
 )
 
 // Mechanism is one candidate COW implementation, with whether this machine can
@@ -49,8 +51,15 @@ func Best(ms []Mechanism) string {
 func detectDmThin(ctx context.Context) Mechanism {
 	m := Mechanism{Name: "dm-thin", Preference: 1,
 		Detail: "preferred: per-device btree, so read cost is flat at any branch depth"}
-	_ = exec.CommandContext(ctx, "modprobe", "dm_thin_pool").Run()
-	out, err := exec.CommandContext(ctx, "dmsetup", "targets").Output()
+	if exe, err := tool.Resolve("modprobe"); err == nil {
+		_ = exec.CommandContext(ctx, exe, "dm_thin_pool").Run()
+	}
+	dmsetup, err := tool.Resolve("dmsetup")
+	if err != nil {
+		m.Detail = "dmsetup unavailable, cannot determine"
+		return m
+	}
+	out, err := exec.CommandContext(ctx, dmsetup, "targets").Output()
 	if err != nil {
 		m.Detail = "dmsetup unavailable, cannot determine"
 		return m
@@ -74,10 +83,12 @@ func detectDmThin(ctx context.Context) Mechanism {
 func detectBtrfs(ctx context.Context) Mechanism {
 	m := Mechanism{Name: "btrfs", Preference: 2,
 		Detail: "validated: 210ms live snapshot, clean recovery, depth-2 verified"}
-	_ = exec.CommandContext(ctx, "modprobe", "btrfs").Run()
+	if exe, err := tool.Resolve("modprobe"); err == nil {
+		_ = exec.CommandContext(ctx, exe, "btrfs").Run()
+	}
 	fs, err := os.ReadFile("/proc/filesystems")
 	if err == nil && strings.Contains(string(fs), "btrfs") {
-		if !mkfsBtrfsPresent() {
+		if _, err := tool.Resolve("mkfs.btrfs"); err != nil {
 			m.Detail = "kernel supports btrfs but mkfs.btrfs is not installed"
 			return m
 		}
@@ -91,7 +102,9 @@ func detectBtrfs(ctx context.Context) Mechanism {
 func detectNBD(ctx context.Context) Mechanism {
 	m := Mechanism{Name: "nbd (qcow2)", Preference: 3,
 		Detail: "userspace daemon in the read path; backing chains are O(depth)"}
-	_ = exec.CommandContext(ctx, "modprobe", "nbd").Run()
+	if exe, err := tool.Resolve("modprobe"); err == nil {
+		_ = exec.CommandContext(ctx, exe, "nbd").Run()
+	}
 	if _, err := os.Stat("/dev/nbd0"); err == nil {
 		m.Available = true
 	} else {
@@ -115,7 +128,12 @@ func detectReflink(ctx context.Context) Mechanism {
 		m.Detail = "could not test: " + err.Error()
 		return m
 	}
-	if err := exec.CommandContext(ctx, "cp", "--reflink=always", src, dir+"/b").Run(); err == nil {
+	cp, err := tool.Resolve("cp")
+	if err != nil {
+		m.Detail = "could not test: " + err.Error()
+		return m
+	}
+	if err := exec.CommandContext(ctx, cp, "--reflink=always", src, dir+"/b").Run(); err == nil {
 		m.Available = true
 		return m
 	}
@@ -135,14 +153,22 @@ func LoopDevicesWork(ctx context.Context) bool {
 	}
 	defer os.Remove(f.Name())
 	f.Close()
-	if err := exec.CommandContext(ctx, "truncate", "-s", "16M", f.Name()).Run(); err != nil {
+	truncate, err := tool.Resolve("truncate")
+	if err != nil {
 		return false
 	}
-	out, err := exec.CommandContext(ctx, "losetup", "-f", "--show", f.Name()).Output()
+	losetup, err := tool.Resolve("losetup")
+	if err != nil {
+		return false
+	}
+	if err := exec.CommandContext(ctx, truncate, "-s", "16M", f.Name()).Run(); err != nil {
+		return false
+	}
+	out, err := exec.CommandContext(ctx, losetup, "-f", "--show", f.Name()).Output()
 	if err != nil {
 		return false
 	}
 	dev := strings.TrimSpace(string(out))
-	_ = exec.CommandContext(ctx, "losetup", "-d", dev).Run()
+	_ = exec.CommandContext(ctx, losetup, "-d", dev).Run()
 	return dev != ""
 }

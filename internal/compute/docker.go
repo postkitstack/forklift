@@ -11,9 +11,11 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/postkitstack/forklift/internal/branch"
+	"github.com/postkitstack/forklift/internal/tool"
 )
 
 // Provider starts and stops a branch's database process.
@@ -49,6 +51,10 @@ type Docker struct {
 	PortLow  int
 	PortHigh int
 	Password string
+
+	exeOnce sync.Once
+	exePath string
+	exeErr  error
 }
 
 func NewDocker() *Docker {
@@ -56,6 +62,22 @@ func NewDocker() *Docker {
 		Network: "forklift", BindHost: "127.0.0.1",
 		PortLow: 15500, PortHigh: 15600, Password: "forklift",
 	}
+}
+
+// dockerExe resolves the docker binary once. Resolution goes through the
+// shared tool resolver so a docker in an sbin dir off PATH is still found.
+func (d *Docker) dockerExe() (string, error) {
+	d.exeOnce.Do(func() { d.exePath, d.exeErr = tool.Resolve("docker") })
+	return d.exePath, d.exeErr
+}
+
+// cmd builds a docker command, or an error if docker could not be found.
+func (d *Docker) cmd(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	exe, err := d.dockerExe()
+	if err != nil {
+		return nil, err
+	}
+	return exec.CommandContext(ctx, exe, args...), nil
 }
 
 // Initdb initialises an empty data directory using the same image the branch
@@ -69,7 +91,11 @@ func (d *Docker) Initdb(ctx context.Context, dataDir, pgVersion string) error {
 		"--entrypoint", "docker-ensure-initdb.sh",
 		d.image(pgVersion),
 	}
-	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+	cmd, err := d.cmd(ctx, args...)
+	if err != nil {
+		return fmt.Errorf("initdb: %w", err)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("initdb: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -93,7 +119,11 @@ func (d *Docker) Start(ctx context.Context, dataDir, pgVersion string) (branch.C
 		"-v", dataDir + ":/var/lib/postgresql/data",
 		d.image(pgVersion),
 	}
-	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	cmd, err := d.cmd(ctx, args...)
+	if err != nil {
+		return branch.ComputeRef{}, err
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return branch.ComputeRef{}, fmt.Errorf("start container: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -111,16 +141,25 @@ func (d *Docker) Stop(ctx context.Context, ref branch.ComputeRef) error {
 	if ref.ContainerID == "" {
 		return nil
 	}
-	_ = exec.CommandContext(ctx, "docker", "stop", ref.ContainerID).Run()
-	return exec.CommandContext(ctx, "docker", "rm", "-f", ref.ContainerID).Run()
+	if cmd, err := d.cmd(ctx, "stop", ref.ContainerID); err == nil {
+		_ = cmd.Run()
+	}
+	cmd, err := d.cmd(ctx, "rm", "-f", ref.ContainerID)
+	if err != nil {
+		return err
+	}
+	return cmd.Run()
 }
 
 func (d *Docker) Running(ctx context.Context, ref branch.ComputeRef) bool {
 	if ref.ContainerID == "" {
 		return false
 	}
-	out, err := exec.CommandContext(ctx, "docker", "inspect",
-		"-f", "{{.State.Running}}", ref.ContainerID).Output()
+	cmd, err := d.cmd(ctx, "inspect", "-f", "{{.State.Running}}", ref.ContainerID)
+	if err != nil {
+		return false
+	}
+	out, err := cmd.Output()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
@@ -131,9 +170,8 @@ func (d *Docker) Running(ctx context.Context, ref branch.ComputeRef) bool {
 func (d *Docker) waitReady(ctx context.Context, ref branch.ComputeRef) error {
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
-		err := exec.CommandContext(ctx, "docker", "exec", ref.ContainerID,
-			"pg_isready", "-U", "postgres").Run()
-		if err == nil {
+		cmd, err := d.cmd(ctx, "exec", ref.ContainerID, "pg_isready", "-U", "postgres")
+		if err == nil && cmd.Run() == nil {
 			return nil
 		}
 		select {
@@ -142,16 +180,22 @@ func (d *Docker) waitReady(ctx context.Context, ref branch.ComputeRef) error {
 		case <-time.After(time.Second):
 		}
 	}
-	logs, _ := exec.Command("docker", "logs", "--tail", "20", ref.ContainerID).CombinedOutput()
+	logs := []byte("docker not found")
+	if cmd, err := d.cmd(context.Background(), "logs", "--tail", "20", ref.ContainerID); err == nil {
+		logs, _ = cmd.CombinedOutput()
+	}
 	return fmt.Errorf("postgres did not become ready within 90s; last logs:\n%s", strings.TrimSpace(string(logs)))
 }
 
 func (d *Docker) ensureNetwork(ctx context.Context) error {
-	if err := exec.CommandContext(ctx, "docker", "network", "inspect", d.Network).Run(); err == nil {
+	if cmd, err := d.cmd(ctx, "network", "inspect", d.Network); err == nil && cmd.Run() == nil {
 		return nil
 	}
-	out, err := exec.CommandContext(ctx, "docker", "network", "create",
-		d.Network).CombinedOutput()
+	cmd, err := d.cmd(ctx, "network", "create", d.Network)
+	if err != nil {
+		return fmt.Errorf("create network: %w", err)
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "already exists") {
 		return fmt.Errorf("create network: %w: %s", err, strings.TrimSpace(string(out)))
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/dennwc/btrfs"
 	"github.com/postkitstack/forklift/internal/branch"
+	"github.com/postkitstack/forklift/internal/tool"
 )
 
 // Subvolume operations go through the pure-Go github.com/dennwc/btrfs library
@@ -72,34 +73,18 @@ func (b *Btrfs) Available(ctx context.Context) (bool, string) {
 	}
 	if !strings.Contains(string(fs), "btrfs") {
 		// Try loading it before giving up.
-		_ = exec.CommandContext(ctx, "modprobe", "btrfs").Run()
+		if exe, err := tool.Resolve("modprobe"); err == nil {
+			_ = exec.CommandContext(ctx, exe, "btrfs").Run()
+		}
 		fs, _ = os.ReadFile("/proc/filesystems")
 		if !strings.Contains(string(fs), "btrfs") {
 			return false, "btrfs not supported by this kernel"
 		}
 	}
-	if !mkfsBtrfsPresent() {
+	if _, err := tool.Resolve("mkfs.btrfs"); err != nil {
 		return false, "btrfs-progs not installed (mkfs.btrfs is required to format the pool)"
 	}
 	return true, ""
-}
-
-// mkfsBtrfsPresent reports whether mkfs.btrfs is installed.
-//
-// It lives in /usr/sbin or /sbin, which Debian/Ubuntu keep off a normal
-// non-root PATH while /usr/bin/btrfs is always reachable, so a bare LookPath
-// false-negatives for unprivileged callers like doctor. Stat the usual
-// locations before giving up.
-func mkfsBtrfsPresent() bool {
-	if _, err := exec.LookPath("mkfs.btrfs"); err == nil {
-		return true
-	}
-	for _, p := range []string{"/usr/sbin/mkfs.btrfs", "/sbin/mkfs.btrfs"} {
-		if _, err := os.Stat(p); err == nil {
-			return true
-		}
-	}
-	return false
 }
 
 func (b *Btrfs) Init(ctx context.Context) error {
@@ -313,8 +298,15 @@ func (b *Btrfs) Usage(ctx context.Context) (Usage, error) {
 	return u, nil
 }
 
+// run shells out to an external command. The binary is resolved by absolute
+// path (see package tool): mount helpers live in /usr/sbin, which is off a
+// normal non-root PATH and off sudo's secure_path alike.
 func run(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
+	exe, err := tool.Resolve(name)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
